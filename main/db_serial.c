@@ -106,8 +106,8 @@ esp_err_t open_uart_serial_socket() {
 esp_err_t open_jtag_serial_socket() {
     // Configure USB SERIAL JTAG
     usb_serial_jtag_driver_config_t usb_serial_jtag_config = {
-            .rx_buffer_size = 256,
-            .tx_buffer_size = 256,
+            .rx_buffer_size = 4096,
+            .tx_buffer_size = 4096,
     };
     ESP_LOGI(TAG, "Initializing USB/JTAG serial interface.");
     return usb_serial_jtag_driver_install(&usb_serial_jtag_config);
