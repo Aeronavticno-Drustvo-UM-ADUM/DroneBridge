@@ -15,3 +15,15 @@ target_include_directories(db_espnow_mavlink_parser_test PRIVATE
 
 add_test(NAME db_espnow_mavlink_parser_test
         COMMAND db_espnow_mavlink_parser_test)
+
+add_executable(db_rtcm_test
+        db_rtcm_test.c
+        ../main/db_rtcm.c)
+
+target_compile_features(db_rtcm_test PRIVATE c_std_11)
+target_compile_options(db_rtcm_test PRIVATE -Wall -Wextra -Wconversion -Werror)
+target_include_directories(db_rtcm_test PRIVATE
+        ../main)
+
+add_test(NAME db_rtcm_test
+        COMMAND db_rtcm_test)
