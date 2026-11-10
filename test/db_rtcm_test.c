@@ -20,6 +20,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "db_rtcm.h"
@@ -109,11 +110,75 @@ static void test_framer_single_frame(void) {
     assert(db_rtcm3_message_type(captured.frames[0], captured.lengths[0]) == 1074);
 }
 
-/** Back-to-back frames, the smallest (empty payload) and the largest frame, split across feeds. */
+/**
+ * Bit by bit reference implementation of CRC-24Q, used to check the table driven version.
+ *
+ * @param data Bytes
+ * @param length Number of bytes
+ * @return 24 bit checksum
+ */
+static uint32_t reference_crc24q(const uint8_t *data, size_t length) {
+    uint32_t crc = 0;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= (uint32_t) data[i] << 16;
+        for (int bit = 0; bit < 8; bit++) {
+            crc <<= 1;
+            if (crc & 0x1000000UL) crc ^= 0x1864CFBUL;
+        }
+    }
+    return crc & 0xFFFFFFUL;
+}
+
+/** The table driven CRC matches the bit by bit definition for every length and many byte patterns. */
+static void test_crc24q_table(void) {
+    static uint8_t data[2048];
+    uint32_t s = 0xA5A5A5A5U;
+    for (size_t i = 0; i < sizeof(data); i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        data[i] = (uint8_t) s;
+    }
+    for (size_t len = 0; len <= sizeof(data); len += (len < 300 ? 1U : 37U)) {
+        assert(db_rtcm3_crc24q(data, len) == reference_crc24q(data, len));
+    }
+}
+
+/** Only RTCM 3 message numbers real bases send are accepted. */
+static void test_message_type_plausibility(void) {
+    assert(!db_rtcm3_message_type_is_plausible(0));
+    assert(!db_rtcm3_message_type_is_plausible(1000));
+    assert(db_rtcm3_message_type_is_plausible(1001));
+    assert(db_rtcm3_message_type_is_plausible(1005) && db_rtcm3_message_type_is_plausible(1006));
+    assert(db_rtcm3_message_type_is_plausible(1074) && db_rtcm3_message_type_is_plausible(1127));
+    assert(db_rtcm3_message_type_is_plausible(1230) && db_rtcm3_message_type_is_plausible(1299));
+    assert(!db_rtcm3_message_type_is_plausible(1300) && !db_rtcm3_message_type_is_plausible(4000));
+    assert(db_rtcm3_message_type_is_plausible(4001) && db_rtcm3_message_type_is_plausible(4072));
+    assert(db_rtcm3_message_type_is_plausible(4095));
+}
+
+/** Frames with a valid CRC but no message number (empty payload) or an implausible one are skipped. */
+static void test_framer_rejects_implausible(void) {
+    uint8_t stream[4 * 64];
+    size_t n = 0;
+    n += build_frame(&stream[n], 0, 0, 1);          // empty payload, valid CRC
+    n += build_frame(&stream[n], 0, 1, 1);          // one payload byte: no full message number
+    n += build_frame(&stream[n], 999, 20, 2);       // message number out of range, valid CRC
+    const uint16_t good_len = build_frame(&stream[n], 1230, 8, 3);
+    const size_t good_pos = n;
+    n += good_len;
+    db_rtcm3_framer_t framer;
+    captured_t captured = {0};
+    db_rtcm3_framer_init(&framer);
+    db_rtcm3_framer_feed(&framer, stream, n, capture_frame, &captured);
+    assert(captured.count == 1 && captured.lengths[0] == good_len);
+    assert(memcmp(captured.frames[0], &stream[good_pos], good_len) == 0);
+    assert(framer.skipped_bytes == good_pos && framer.length == 0);
+}
+
+/** Back-to-back frames, the smallest (2 byte payload) and the largest frame, split across feeds. */
 static void test_framer_sizes_and_splits(void) {
     uint8_t stream[3 * DB_RTCM3_MAX_FRAME_LEN];
     uint16_t lengths[3];
-    lengths[0] = build_frame(stream, 0, 0, 1);
+    lengths[0] = build_frame(stream, 1230, 2, 1);
     lengths[1] = build_frame(&stream[lengths[0]], 1005, 19, 2);
     lengths[2] = build_frame(&stream[lengths[0] + lengths[1]], 4094, DB_RTCM3_MAX_PAYLOAD_LEN, 9);
     const size_t total = (size_t) lengths[0] + lengths[1] + lengths[2];
@@ -179,6 +244,48 @@ static void test_framer_resync(void) {
     }
     assert(captured.count == 1 && memcmp(captured.frames[0], frame, len) == 0);
     assert(framer.skipped_bytes == n - len);
+}
+
+/** A false header claiming a long frame no longer holds real frames back once the input goes quiet. */
+static void test_framer_on_idle_releases_frames(void) {
+    uint8_t stream[64 + 2 * DB_RTCM3_MAX_FRAME_LEN];
+    size_t n = 0;
+    // false start: plausible type 1005, claims 1023 payload bytes
+    const uint8_t fake[] = {DB_RTCM3_PREAMBLE, 0x03, 0xFF, 0x3E, 0xD0, 0x11, 0x22};
+    memcpy(stream, fake, sizeof(fake));
+    n += sizeof(fake);
+    uint8_t a[DB_RTCM3_MAX_FRAME_LEN], b[DB_RTCM3_MAX_FRAME_LEN];
+    const uint16_t la = build_frame(a, 1005, 19, 1), lb = build_frame(b, 1074, 160, 2);
+    memcpy(&stream[n], a, la);
+    n += la;
+    memcpy(&stream[n], b, lb);
+    n += lb;
+
+    db_rtcm3_framer_t framer;
+    captured_t captured = {0};
+    db_rtcm3_framer_init(&framer);
+    db_rtcm3_framer_feed(&framer, stream, n, capture_frame, &captured);
+    assert(captured.count == 0);    // held back by the false start
+    db_rtcm3_framer_on_idle(&framer, capture_frame, &captured);
+    assert(captured.count == 2);
+    assert(captured.lengths[0] == la && memcmp(captured.frames[0], a, la) == 0);
+    assert(captured.lengths[1] == lb && memcmp(captured.frames[1], b, lb) == 0);
+    assert(framer.length == 0 && framer.skipped_bytes == sizeof(fake));
+
+    // a real frame paused in the middle is never cut by an idle call
+    memset(&captured, 0, sizeof(captured));
+    db_rtcm3_framer_init(&framer);
+    db_rtcm3_framer_feed(&framer, b, 80, capture_frame, &captured);
+    db_rtcm3_framer_on_idle(&framer, capture_frame, &captured);
+    db_rtcm3_framer_on_idle(&framer, capture_frame, &captured);
+    assert(captured.count == 0 && framer.length == 80);
+    db_rtcm3_framer_feed(&framer, &b[80], (size_t) lb - 80U, capture_frame, &captured);
+    assert(captured.count == 1 && memcmp(captured.frames[0], b, lb) == 0 && framer.skipped_bytes == 0);
+
+    // idle on an empty framer or NULL does nothing
+    db_rtcm3_framer_on_idle(&framer, capture_frame, &captured);
+    db_rtcm3_framer_on_idle(NULL, capture_frame, &captured);
+    assert(captured.count == 1 && framer.length == 0);
 }
 
 /** NULL arguments are ignored without crashing. */
@@ -325,6 +432,131 @@ static void test_split_roundtrip(void) {
     }
 }
 
+/** Deterministic xorshift32 random generator, so failures are reproducible. */
+static uint32_t fuzz_state = 0x12345678U;
+
+/**
+ * Returns the next pseudo random number.
+ *
+ * @return 32 bit pseudo random value
+ */
+static uint32_t fuzz_next(void) {
+    fuzz_state ^= fuzz_state << 13;
+    fuzz_state ^= fuzz_state >> 17;
+    fuzz_state ^= fuzz_state << 5;
+    return fuzz_state;
+}
+
+/** Expected frames of one fuzz stream and how many of them were seen. */
+typedef struct {
+    size_t expected;
+    size_t matched;
+    size_t unexpected;
+    uint16_t lengths[64];
+    uint8_t *frames[64];
+} fuzz_check_t;
+
+/**
+ * Framer callback for the fuzz test: every reported frame must be the next expected valid frame, in order.
+ *
+ * @param frame Reported frame
+ * @param frame_length Frame length
+ * @param context fuzz_check_t
+ */
+static void fuzz_frame(const uint8_t *frame, uint16_t frame_length, void *context) {
+    fuzz_check_t *check = (fuzz_check_t *) context;
+    // A reported frame must always carry a valid CRC.
+    const uint32_t crc = ((uint32_t) frame[frame_length - 3] << 16) | ((uint32_t) frame[frame_length - 2] << 8) |
+                         frame[frame_length - 1];
+    assert(db_rtcm3_crc24q(frame, (size_t) frame_length - 3U) == crc);
+    if (check->matched < check->expected && check->lengths[check->matched] == frame_length &&
+        memcmp(check->frames[check->matched], frame, frame_length) == 0) {
+        check->matched++;
+    } else {
+        check->unexpected++;
+    }
+}
+
+/**
+ * Fuzz test: random streams of noise, fake headers, corrupted frames and valid frames, fed in random chunks.
+ * Every valid frame that is separated from noise by a known boundary must come out exactly once and in order, nothing
+ * may crash or read out of bounds (run with sanitizers), and no frame with a wrong CRC may ever be reported.
+ */
+static void test_framer_fuzz(void) {
+    static uint8_t stream[64 * (DB_RTCM3_MAX_FRAME_LEN + 64)];
+    static uint8_t frames[64][DB_RTCM3_MAX_FRAME_LEN];
+    size_t total_frames = 0, total_unexpected = 0;
+    // RTCM_FUZZ_ROUNDS raises the number of rounds for long runs, the default keeps CTest fast.
+    const char *rounds_env = getenv("RTCM_FUZZ_ROUNDS");
+    const uint32_t rounds = rounds_env != NULL ? (uint32_t) strtoul(rounds_env, NULL, 10) : 3000U;
+    for (uint32_t round = 0; round < rounds; round++) {
+        fuzz_check_t check = {0};
+        size_t n = 0;
+        const size_t items = 1U + fuzz_next() % 40U;
+        for (size_t item = 0; item < items; item++) {
+            const uint32_t kind = fuzz_next() % 6U;
+            if (kind == 0) {            // random noise, may contain 0xD3
+                const size_t len = fuzz_next() % 80U;
+                for (size_t i = 0; i < len; i++) stream[n++] = (uint8_t) fuzz_next();
+            } else if (kind == 1) {     // fake header claiming a long frame, followed by noise
+                stream[n++] = DB_RTCM3_PREAMBLE;
+                stream[n++] = (uint8_t) (fuzz_next() & 0x03U);
+                stream[n++] = (uint8_t) fuzz_next();
+                const size_t len = fuzz_next() % 40U;
+                for (size_t i = 0; i < len; i++) stream[n++] = (uint8_t) fuzz_next();
+            } else if (kind == 2) {     // corrupted frame (one bit flipped)
+                uint8_t bad[DB_RTCM3_MAX_FRAME_LEN];
+                const uint16_t len = build_frame(bad, 1077, (uint16_t) (fuzz_next() % 300U), (uint8_t) fuzz_next());
+                bad[fuzz_next() % len] ^= (uint8_t) (1U << (fuzz_next() % 8U));
+                memcpy(&stream[n], bad, len);
+                n += len;
+            } else {                    // valid frame
+                if (check.expected >= 64) continue;
+                uint16_t payload = (uint16_t) (2U + (fuzz_next() % 10U == 0 ? fuzz_next() % 1022U : fuzz_next() % 300U));
+                const uint16_t len = build_frame(frames[check.expected], 1074, payload, (uint8_t) fuzz_next());
+                check.frames[check.expected] = frames[check.expected];
+                check.lengths[check.expected] = len;
+                check.expected++;
+                memcpy(&stream[n], frames[check.expected - 1], len);
+                n += len;
+            }
+            assert(n < sizeof(stream) - 2 * DB_RTCM3_MAX_FRAME_LEN);
+        }
+        // trailing valid frame flushes any fake header that could still be waiting for bytes
+        if (check.expected < 64) {
+            const uint16_t len = build_frame(frames[check.expected], 1005, 19, (uint8_t) round);
+            check.frames[check.expected] = frames[check.expected];
+            check.lengths[check.expected] = len;
+            check.expected++;
+            memcpy(&stream[n], frames[check.expected - 1], len);
+            n += len;
+        }
+        db_rtcm3_framer_t framer;
+        db_rtcm3_framer_init(&framer);
+        size_t pos = 0;
+        while (pos < n) {
+            size_t chunk = 1U + fuzz_next() % 1100U;
+            if (chunk > n - pos) chunk = n - pos;
+            db_rtcm3_framer_feed(&framer, &stream[pos], chunk, fuzz_frame, &check);
+            pos += chunk;
+            assert(framer.length <= DB_RTCM3_MAX_FRAME_LEN);
+            if (fuzz_next() % 3U == 0) {
+                db_rtcm3_framer_on_idle(&framer, fuzz_frame, &check);   // input paused at a random point
+            }
+        }
+        // A fake header can still be waiting for bytes at the end of the stream. Zeros complete it (wrong CRC),
+        // after which every valid frame it was covering must come out. No valid frame may ever be lost.
+        static const uint8_t zeros[DB_RTCM3_MAX_FRAME_LEN + 64] = {0};
+        db_rtcm3_framer_feed(&framer, zeros, sizeof(zeros), fuzz_frame, &check);
+        assert(check.matched + check.unexpected == framer.frames);
+        assert(check.matched == check.expected);
+        total_frames += check.matched;
+        total_unexpected += check.unexpected;
+    }
+    printf("db_rtcm_test: fuzz matched %zu valid frames, %zu frames formed by noise (valid CRC)\n",
+           total_frames, total_unexpected);
+}
+
 /**
  * Runs all RTCM helper tests.
  *
@@ -332,12 +564,17 @@ static void test_split_roundtrip(void) {
  */
 int main(void) {
     test_crc24q();
+    test_crc24q_table();
+    test_message_type_plausibility();
+    test_framer_rejects_implausible();
     test_framer_single_frame();
     test_framer_sizes_and_splits();
     test_framer_resync();
+    test_framer_on_idle_releases_frames();
     test_framer_invalid_arguments();
     test_split_layout();
     test_split_roundtrip();
+    test_framer_fuzz();
     printf("db_rtcm_test: all tests passed\n");
     return 0;
 }

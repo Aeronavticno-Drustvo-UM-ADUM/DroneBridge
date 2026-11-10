@@ -17,7 +17,7 @@ let set_telem_proto = null;		// Telemetry protocol received by the ESP32
 function change_radio_dis_arm_visibility() {
 	// we only support this feature when MAVLink or LTM are set AND when a standard Wi-Fi mode or BLE is enabled
 	let radio_dis_onarm_div = document.getElementById("radio_dis_onarm_div")
-	if ((document.getElementById("esp32_mode").value > "2" &&  document.getElementById("esp32_mode").value < "6") || document.getElementById("proto").value === "5") {
+	if ((document.getElementById("esp32_mode").value > "2" &&  document.getElementById("esp32_mode").value < "6") || document.getElementById("proto").value === "5" || document.getElementById("proto").value === "6") {
 		radio_dis_onarm_div.style.display = "none";
 	} else {
 		radio_dis_onarm_div.style.display = "block";

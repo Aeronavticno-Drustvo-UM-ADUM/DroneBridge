@@ -281,7 +281,7 @@ db_parameter_t db_param_proto = {
                         .value = DB_SERIAL_PROTOCOL_MAVLINK,
                         .default_value = DB_SERIAL_PROTOCOL_MAVLINK,
                         .min = DB_SERIAL_PROTOCOL_MSPLTM,
-                        .max = DB_SERIAL_PROTOCOL_TRANSPARENT,
+                        .max = DB_SERIAL_PROTOCOL_RTCM_TO_MAVLINK,
                 }
         }
 };

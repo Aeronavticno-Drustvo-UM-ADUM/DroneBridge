@@ -479,6 +479,10 @@ void read_process_serial_link(int *tcp_clients, uint *transparent_buff_pos, uint
         case DB_SERIAL_PROTOCOL_MAVLINK:
             db_read_serial_parse_mavlink(tcp_clients, udp_conn_list, msp_message_buffer, transparent_buff_pos);
             break;
+        case DB_SERIAL_PROTOCOL_RTCM_TO_MAVLINK:
+            // Same buffer as the MAVLink mode: a runtime switch between both modes only ever holds MAVLink frames.
+            db_read_serial_rtcm_to_mavlink(tcp_clients, udp_conn_list, msp_message_buffer, transparent_buff_pos);
+            break;
         case DB_SERIAL_PROTOCOL_TRANSPARENT:
         default:
             db_read_serial_parse_transparent(tcp_clients, udp_conn_list, serial_buffer, transparent_buff_pos);

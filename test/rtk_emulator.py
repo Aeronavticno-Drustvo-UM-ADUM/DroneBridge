@@ -25,6 +25,7 @@ Example:
 import argparse
 import collections
 import os
+import struct
 import sys
 import threading
 import time
@@ -353,6 +354,37 @@ def frame_source(args):
             time.sleep(1.0)
 
 
+def set_gnd_protocol(connection, protocol: int) -> None:
+    """
+    Sets the serial protocol (SERIAL_TEL_PROTO) of the DroneBridge GND unit on 'connection' via MAVLink PARAM_SET.
+    Every MAVLink message the GND reads from serial is also broadcast to the AIR units, so the request must not be a
+    broadcast: a GCS heartbeat first makes the GND adopt system id 255 (AIR units keep the id of their flight
+    controller), then PARAM_SET is addressed to 255 / component 68 (DroneBridge, MAV_COMP_ID_TELEMETRY_RADIO).
+    DroneBridge reads integer parameters byte-wise from the float field (MAVLink "bytewise" encoding).
+    In RTCM mode (6) the GND no longer writes to its serial port, so switching to 6 is not acknowledged.
+
+    :param connection: pymavlink connection of the GND unit, source system 255
+    :param protocol: 1 MSP/LTM, 4 MAVLink, 5 transparent, 6 RTCM in -> MAVLink
+    """
+    for _ in range(3):
+        connection.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        time.sleep(0.3)
+    value = struct.unpack("<f", struct.pack("<I", protocol))[0]
+    connection.mav.param_set_send(255, mavutil.mavlink.MAV_COMP_ID_TELEMETRY_RADIO, b"SERIAL_TEL_PROTO", value,
+                                  mavutil.mavlink.MAV_PARAM_TYPE_UINT8)
+    end = time.monotonic() + 2.0
+    while time.monotonic() < end:
+        msg = connection.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.3)
+        if msg is not None and msg.param_id == "SERIAL_TEL_PROTO":
+            got = struct.unpack("<I", struct.pack("<f", msg.param_value))[0] & 0xFF
+            print(f"GND confirmed SERIAL_TEL_PROTO = {got}")
+            return
+    if protocol == 6:
+        print("PARAM_SET sent. No reply is expected: in RTCM mode the GND does not write to its serial port.")
+    else:
+        print("PARAM_SET sent, but the GND did not confirm it.")
+
+
 def main() -> int:
     """
     Parses the command line, streams RTCM through the link and prints a summary.
@@ -373,6 +405,11 @@ def main() -> int:
     parser.add_argument("--filler-bytes", type=int, default=600, help="synthetic: filler payload bytes per second")
     parser.add_argument("--pace-ms", type=float, default=0.0,
                         help="pause after every GPS_RTCM_DATA message in ms (0 = burst like a GCS)")
+    parser.add_argument("--raw", action="store_true",
+                        help="send raw RTCM3 to the GND like a GNSS base (GND must be in protocol 6, RTCM -> MAVLink)")
+    parser.add_argument("--set-gnd-proto", type=int, choices=[1, 4, 5, 6],
+                        help="only set the GND serial protocol via MAVLink and exit (switching away from 6 needs the "
+                             "web interface, because the GND no longer parses MAVLink in RTCM mode)")
     parser.add_argument("--station-id", type=int, default=0, help="synthetic: RTCM reference station id")
     parser.add_argument("--ecef", type=lambda s: tuple(float(v) for v in s.split(",")), default=EXAMPLE_BASE_ECEF_M,
                         help="synthetic: base position as ECEF x,y,z in metres")
@@ -383,6 +420,9 @@ def main() -> int:
         parser.error("--filler-bytes must be 6..1023")
 
     gnd = mavutil.mavlink_connection(args.gnd, baud=args.gnd_baud, source_system=255, source_component=190)
+    if args.set_gnd_proto is not None:
+        set_gnd_protocol(gnd, args.set_gnd_proto)
+        return 0
     sender = RtcmSender(gnd, args.pace_ms / 1000.0)
     sent = collections.Counter()
     stats = {"ok": 0, "unexpected": 0, "by_type": collections.Counter(), "lock": threading.Lock()}
@@ -394,7 +434,8 @@ def main() -> int:
         receiver.start()
 
     source = args.file or args.base or "synthetic"
-    print(f"Streaming RTCM ({source}) to {args.gnd} for up to {args.duration:g} s - Ctrl+C to stop early")
+    form = "raw RTCM3, the GND wraps it as #233" if args.raw else "GPS_RTCM_DATA #233"
+    print(f"Streaming RTCM ({source}, {form}) to {args.gnd} for up to {args.duration:g} s - Ctrl+C to stop early")
     frames_sent = 0
     bytes_sent = 0
     sent_by_type = collections.Counter()
@@ -402,19 +443,25 @@ def main() -> int:
     try:
         for frame in frame_source(args):
             now = time.monotonic()
-            if now - last_heartbeat >= 1.0:
+            if not args.raw and now - last_heartbeat >= 1.0:
                 gnd.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
                 last_heartbeat = now
             with stats["lock"]:
                 sent[frame] += 1
-            sender.send_frame(frame)
+            if args.raw:
+                gnd.write(frame)
+            else:
+                sender.send_frame(frame)
             frames_sent += 1
             bytes_sent += len(frame)
             sent_by_type[rtcm3_message_type(frame)] += 1
     except KeyboardInterrupt:
         pass
 
-    print(f"Sent {frames_sent} RTCM3 frames ({bytes_sent} bytes) in {sender.messages_sent} GPS_RTCM_DATA messages")
+    if args.raw:
+        print(f"Sent {frames_sent} raw RTCM3 frames ({bytes_sent} bytes)")
+    else:
+        print(f"Sent {frames_sent} RTCM3 frames ({bytes_sent} bytes) in {sender.messages_sent} GPS_RTCM_DATA messages")
     print("  by type: " + ", ".join(f"{t}: {n}" for t, n in sorted(sent_by_type.items())))
     if receiver is None:
         print("No --air port given, nothing verified.")

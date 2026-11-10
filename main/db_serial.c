@@ -44,6 +44,7 @@
 #define FASTMAVLINK_ROUTER_COMPONENTS_MAX  5
 
 #include "db_mavlink_msgs.h"
+#include "db_rtcm.h"
 
 #define TAG "DB_SERIAL"
 
@@ -137,6 +138,10 @@ esp_err_t open_serial_socket() {
  * @param data_length Size of payload to write to UART
  */
 void write_to_serial(const uint8_t data_buffer[], const unsigned int data_length) {
+    if (DB_PARAM_SERIAL_PROTO == DB_SERIAL_PROTOCOL_RTCM_TO_MAVLINK) {
+        // The serial port is the RTCM output of a GNSS base. Never send radio data or generated messages into it.
+        return;
+    }
 #ifdef CONFIG_DB_SERIAL_OPTION_JTAG
     // Writes data from buffer to JTAG based serial interface
     int written = usb_serial_jtag_write_bytes(data_buffer, data_length, 20 / portTICK_PERIOD_MS);
@@ -495,4 +500,136 @@ void db_read_serial_parse_transparent(int tcp_clients[], udp_conn_list_t *udp_co
         *serial_read_bytes = 0; // reset buffer position
         serial_read_timeout_reached = false;    // reset serial read timeout
     }
+}
+
+/** State shared with the RTCM framer callback while one serial read is converted to MAVLink. */
+typedef struct {
+    int *tcp_clients;
+    udp_conn_list_t *udp_conns;
+    uint8_t *serial_buffer;
+    unsigned int *serial_buff_pos;
+    uint16_t packet_size;
+} db_rtcm_to_mavlink_ctx_t;
+
+// MAVLink system id of the GPS_RTCM_DATA messages generated in RTCM mode. A fixed id of its own, so the corrections
+// never appear to come from a vehicle (INAV/ArduPilot use 1..n) or a ground control station (usually 255).
+#define DB_RTCM_MAV_SYS_ID 67U
+
+static db_rtcm3_framer_t db_rtcm_framer;    // static zero init = empty framer
+static fmav_status_t fmav_status_rtcm;      // transmit sequence of the generated GPS_RTCM_DATA messages
+static uint8_t db_rtcm_mav_sequence = 0;    // 5 bit GPS_RTCM_DATA sequence id for fragmented RTCM messages
+
+/**
+ * Adds one complete MAVLink frame to the radio send buffer, using the same rules as the MAVLink serial mode:
+ * the buffer is sent first if the frame does not fit, and a frame larger than the packet size is sent in chunks.
+ *
+ * @param ctx Send buffer, its fill position and the radio clients
+ * @param frame Complete MAVLink frame
+ * @param frame_length Number of bytes in frame
+ */
+static void db_rtcm_buffer_mavlink_frame(db_rtcm_to_mavlink_ctx_t *ctx, uint8_t *frame, uint16_t frame_length) {
+    if (frame_length > ctx->packet_size) {
+        if (*ctx->serial_buff_pos > 0) {
+            db_send_to_all_clients(ctx->tcp_clients, ctx->udp_conns, ctx->serial_buffer, *ctx->serial_buff_pos);
+            *ctx->serial_buff_pos = 0;
+        }
+        uint16_t sent_bytes = 0;
+        while (sent_bytes < frame_length) {
+            uint16_t chunk = frame_length - sent_bytes;
+            if (chunk > ctx->packet_size) {
+                chunk = ctx->packet_size;
+            }
+            db_send_to_all_clients(ctx->tcp_clients, ctx->udp_conns, &frame[sent_bytes], chunk);
+            sent_bytes += chunk;
+        }
+        return;
+    }
+    if (*ctx->serial_buff_pos + frame_length > ctx->packet_size) {
+        db_send_to_all_clients(ctx->tcp_clients, ctx->udp_conns, ctx->serial_buffer, *ctx->serial_buff_pos);
+        *ctx->serial_buff_pos = 0;
+    }
+    memcpy(&ctx->serial_buffer[*ctx->serial_buff_pos], frame, frame_length);
+    *ctx->serial_buff_pos += frame_length;
+}
+
+/**
+ * RTCM framer callback: wraps one complete, CRC-checked RTCM3 frame into MAVLink GPS_RTCM_DATA messages (#233),
+ * fragmented according to the MAVLink rules, and adds them to the radio send buffer.
+ *
+ * @param frame Complete RTCM3 frame
+ * @param frame_length Number of bytes in frame
+ * @param context db_rtcm_to_mavlink_ctx_t of the current serial read
+ */
+static void db_rtcm_frame_to_mavlink(const uint8_t *frame, uint16_t frame_length, void *context) {
+    db_rtcm_to_mavlink_ctx_t *ctx = (db_rtcm_to_mavlink_ctx_t *) context;
+    db_rtcm_mav_part_t parts[DB_RTCM_MAV_MAX_PARTS];
+    const uint8_t part_count = db_rtcm_mav_split(frame, frame_length, &db_rtcm_mav_sequence, parts);
+    for (uint8_t i = 0; i < part_count; i++) {
+        // fastmavlink always copies the full 180 byte data field, so never hand it a pointer into the frame directly
+        uint8_t data[DB_RTCM_MAV_DATA_LEN] = {0};
+        memcpy(data, parts[i].data, parts[i].length);
+        uint8_t mav_frame[FASTMAVLINK_MSG_GPS_RTCM_DATA_FRAME_LEN_MAX];
+        const uint16_t mav_frame_length = fmav_msg_gps_rtcm_data_pack_to_frame_buf(
+                mav_frame, DB_RTCM_MAV_SYS_ID, db_get_mav_comp_id(), parts[i].flags, parts[i].length, data,
+                &fmav_status_rtcm);
+        db_rtcm_buffer_mavlink_frame(ctx, mav_frame, mav_frame_length);
+    }
+    ESP_LOGD(TAG, "RTCM %u (%u bytes) -> %u GPS_RTCM_DATA", db_rtcm3_message_type(frame, frame_length), frame_length,
+             part_count);
+}
+
+/**
+ * Reads raw RTCM3 from the serial interface (e.g. the RTCM output of a GNSS base), checks every frame with its CRC and
+ * sends it via the radio link as MAVLink GPS_RTCM_DATA (#233) messages. Bytes that are not part of a valid RTCM3 frame
+ * (UBX, NMEA, noise) are skipped. The generated MAVLink frames are packed like in the MAVLink serial mode and the send
+ * buffer is flushed when the configured serial read timeout passes without new serial data.
+ *
+ * @param tcp_clients Array of connected TCP clients
+ * @param udp_conns Structure containing all UDP connection data including the sockets
+ * @param serial_buffer Buffer that collects MAVLink frames until they are sent via radio
+ * @param serial_buff_pos Number of bytes already in serial_buffer
+ */
+void db_read_serial_rtcm_to_mavlink(int *tcp_clients, udp_conn_list_t *udp_conns, uint8_t *serial_buffer,
+                                    unsigned int *serial_buff_pos) {
+    uint8_t uart_read_buf[DB_SERIAL_PACK_SIZE_MAX];
+    uint16_t packet_size = DB_PARAM_SERIAL_PACK_SIZE;
+    if (packet_size < 1U) {
+        packet_size = 1U;
+    } else if (packet_size > DB_SERIAL_PACK_SIZE_MAX) {
+        packet_size = DB_SERIAL_PACK_SIZE_MAX;
+    }
+    db_rtcm_to_mavlink_ctx_t ctx = {
+            .tcp_clients = tcp_clients,
+            .udp_conns = udp_conns,
+            .serial_buffer = serial_buffer,
+            .serial_buff_pos = serial_buff_pos,
+            .packet_size = packet_size,
+    };
+
+    // Flush data accumulated with a larger previous packet size before using the new limit.
+    if (*serial_buff_pos >= packet_size) {
+        db_send_to_all_clients(tcp_clients, udp_conns, serial_buffer, *serial_buff_pos);
+        *serial_buff_pos = 0;
+    }
+
+    static TickType_t last_tick = 0;    // time when we received something from the serial interface for the last time
+    const TickType_t current_tick = xTaskGetTickCount();
+
+    const int bytes_read = db_read_serial(uart_read_buf, sizeof(uart_read_buf));
+    if (bytes_read <= 0) {
+        // did not read anything this cycle -> check serial read timeout
+        if (current_tick - last_tick >= pdMS_TO_TICKS(DB_PARAM_SERIAL_TIMEOUT_MS)) {
+            last_tick = current_tick;
+            // Release real frames held back by a false frame start that is still waiting for bytes.
+            db_rtcm3_framer_on_idle(&db_rtcm_framer, db_rtcm_frame_to_mavlink, &ctx);
+            if (*serial_buff_pos > 0) {
+                db_send_to_all_clients(tcp_clients, udp_conns, serial_buffer, *serial_buff_pos);
+                *serial_buff_pos = 0;
+            }
+        }
+        return;
+    }
+    last_tick = current_tick;
+    serial_total_byte_count += bytes_read;
+    db_rtcm3_framer_feed(&db_rtcm_framer, uart_read_buf, (size_t) bytes_read, db_rtcm_frame_to_mavlink, &ctx);
 }

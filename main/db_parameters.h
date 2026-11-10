@@ -119,7 +119,8 @@ enum E_DB_WIFI_MODE {
 enum E_DB_SERIAL_PROTOCOL {
     DB_SERIAL_PROTOCOL_MSPLTM = 1,
     DB_SERIAL_PROTOCOL_MAVLINK = 4,
-    DB_SERIAL_PROTOCOL_TRANSPARENT = 5
+    DB_SERIAL_PROTOCOL_TRANSPARENT = 5,
+    DB_SERIAL_PROTOCOL_RTCM_TO_MAVLINK = 6  // serial input is raw RTCM3 from a GNSS base, sent via radio as MAVLink GPS_RTCM_DATA
 };
 
 typedef struct db_parameter_str_s {

@@ -105,6 +105,19 @@ This setting does not change the UART driver read timeout or the `trans_pack_siz
 
 Regression checks need no ESP32 hardware. Activate this project's ESP-IDF environment with the RISC-V compiler and QEMU installed, then run python test/test_serial_timeout.py. The check executes both production loop bodies with mocked UART, radio and scheduler ticks, including live timeout changes, boundary values, packet-size flushing and tick wraparound. It also verifies that the former fixed 20 ms behavior fails. Explicit tool paths can be supplied with --cc and --qemu.
 
+### RTCM in → MAVLink (RTK base on a ground station)
+
+Serial protocol `6` (web interface: "RTCM in → MAVLink (RTK base)", MAVLink parameter `SERIAL_TEL_PROTO = 6`) turns a ground station into an RTK correction sender without a PC. Wire the RTCM3 output of a GNSS base (e.g. u-blox F9P UART1 TX) to the ESP32 RX. DroneBridge then:
+
+- reads the raw byte stream and extracts complete RTCM3 frames. A frame is only accepted with a valid CRC-24Q and a plausible RTCM 3 message number (1001-1299 or 4001-4095), so UBX, NMEA and line noise on the same port are skipped,
+- wraps every frame into MAVLink `GPS_RTCM_DATA` (#233) messages following the MAVLink fragmentation rules (up to 180 bytes per message, up to 4 fragments, larger frames as consecutive messages). They are sent with the fixed MAVLink system id 67 and component id 68, so they never appear to come from a vehicle or a ground control station,
+- packs and sends them like the MAVLink serial mode (packet size and serial read timeout apply),
+- never writes anything back to the serial port. Leave the ESP32 TX unconnected.
+
+When the input stays quiet for the serial read timeout while the framer still waits for the rest of a frame, it checks whether a complete valid frame already starts later in its buffer. If so, the frame start it waited on was false (e.g. a corrupted byte) and the real frames behind it are sent immediately instead of being held back.
+
+In this mode the ground station does not parse MAVLink on its serial port. To leave it, use the web interface (short press on the boot button for access point mode). The framer and splitter are unit tested on the host (`test/db_rtcm_test.c`, incl. a fuzz test, run it with `RTCM_FUZZ_ROUNDS=300000` for a long run). `test/rtcm_stress.py` stress tests the complete link on hardware.
+
 ## Use with QGroundControl, Mission Planner or any other GCS
 
 ![QGroundControl](https://docs.qgroundcontrol.com/master/assets/connected_vehicle.C1qygcZV.jpg)

@@ -78,6 +78,15 @@ typedef struct {
 uint32_t db_rtcm3_crc24q(const uint8_t *data, size_t length);
 
 /**
+ * Tells if a message number belongs to the RTCM 3 ranges real GNSS bases send: standard messages 1001-1299 and
+ * proprietary 4001-4095. The framer only accepts frames with such a number.
+ *
+ * @param message_type 12 bit RTCM message number
+ * @return true if the number is plausible for a correction stream
+ */
+bool db_rtcm3_message_type_is_plausible(uint16_t message_type);
+
+/**
  * Returns the 12 bit RTCM message number of a frame (e.g. 1005).
  *
  * @param frame Complete RTCM3 frame
@@ -94,9 +103,10 @@ uint16_t db_rtcm3_message_type(const uint8_t *frame, uint16_t frame_length);
 void db_rtcm3_framer_init(db_rtcm3_framer_t *framer);
 
 /**
- * Feeds raw bytes into the framer. Every complete frame with a valid CRC is reported through the callback, in the
- * order it appeared in the stream. Bytes that do not belong to a valid frame (other protocols such as UBX or NMEA,
- * line noise, frames with a wrong CRC) are skipped and counted. Partial frames are kept until the next call.
+ * Feeds raw bytes into the framer. Every complete frame with a valid CRC and a plausible message number (see
+ * db_rtcm3_message_type_is_plausible()) is reported through the callback, in the order it appeared in the stream.
+ * Bytes that do not belong to such a frame (other protocols such as UBX or NMEA, line noise, frames with a wrong CRC,
+ * frames without a message number) are skipped and counted. Partial frames are kept until the next call.
  *
  * @param framer Framer state
  * @param data Received bytes
@@ -106,6 +116,19 @@ void db_rtcm3_framer_init(db_rtcm3_framer_t *framer);
  */
 void db_rtcm3_framer_feed(db_rtcm3_framer_t *framer, const uint8_t *data, size_t length,
                           db_rtcm3_frame_cb_t callback, void *context);
+
+/**
+ * Call when the input has been quiet for a while (e.g. on the serial read timeout). If the framer is still waiting
+ * for the rest of a frame, but a complete valid frame already starts later in its buffer, the frame start it is
+ * waiting on was a false one (e.g. a corrupted byte that looks like a header claiming a long frame). That false start
+ * is dropped, so the real frames behind it are reported now instead of when enough further bytes have arrived. A real
+ * frame that is merely paused in the middle never contains a complete valid frame, so it is kept.
+ *
+ * @param framer Framer state
+ * @param callback Called for every complete frame, may be NULL
+ * @param context Passed unchanged to the callback
+ */
+void db_rtcm3_framer_on_idle(db_rtcm3_framer_t *framer, db_rtcm3_frame_cb_t callback, void *context);
 
 /**
  * Splits one RTCM3 frame into GPS_RTCM_DATA parts following the MAVLink fragmentation rules (same as ArduPilot and
