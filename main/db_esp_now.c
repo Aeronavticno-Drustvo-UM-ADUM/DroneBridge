@@ -650,8 +650,11 @@ bool db_espnow_schedule_internal_telemetry_packet() {
     memcpy(evt.data, db_esp_now_clients_list, payload_size);
     evt.data_len = payload_size;
     evt.packet_type = DB_ESP_NOW_PACKET_TYPE_INTERNAL_TELEMETRY;
-    if (xQueueSend(db_espnow_send_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-        ESP_LOGW(TAG, "Send to db_espnow_send_queue queue fail");
+    // Never wait here: this runs in the ESP-NOW task, the only task that empties db_espnow_send_queue. Waiting for a
+    // free slot blocked the task on itself for ESPNOW_MAXDELAY per sent packet whenever the queue was full (data
+    // bursts), which throttled the whole link to ~2 packets/s. If the queue is full, the caller retries later.
+    if (xQueueSend(db_espnow_send_queue, &evt, 0) != pdTRUE) {
+        ESP_LOGD(TAG, "Send queue full - internal telemetry frame postponed");
         free(evt.data);
         return false;
     } else {
